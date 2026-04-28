@@ -1,0 +1,501 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# A distributed simulation of the Conway's Game of Life
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.12"}
+])
+```
+
+## Cell Module
+
+The Life.Cell module models each cell as an autonomous GenServer that exchanges messages with its neighbours and computes its next state locally before synchronizing with the coordinator.
+
+```elixir
+defmodule Life.Cell do
+  use GenServer
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  def start(opts) do
+    GenServer.start(__MODULE__, opts)
+  end
+
+  def set_neighbors(pid, neighbors), do: GenServer.cast(pid, {:set_neighbors, neighbors})
+  def get_state(pid), do: GenServer.call(pid, :get_state)
+  def request_neighbors(pid), do: GenServer.cast(pid, :request_neighbors)
+  def apply_next(pid), do: GenServer.cast(pid, :apply_next)
+
+  def init(opts) do
+    {:ok,
+     %{
+       x: opts[:x],
+       y: opts[:y],
+       alive: opts[:alive],
+       neighbors: [],
+       neighbor_count: 0,
+       responses_received: 0,
+       next_state: nil,
+       coordinator: opts[:coordinator]
+     }}
+  end
+
+  def handle_cast({:set_neighbors, neighbors}, state) do
+    {:noreply, %{state | neighbors: neighbors}}
+  end
+
+  def handle_cast(:request_neighbors, state) do
+    Enum.each(state.neighbors, fn neighbor_pid ->
+      send(neighbor_pid, {:state_request, self()})
+    end)
+
+    {:noreply, %{state | neighbor_count: 0, responses_received: 0}}
+  end
+
+  def handle_cast({:neighbor_state, alive_state}, state) do
+    new_count = state.neighbor_count + if alive_state == 1, do: 1, else: 0
+    new_responses = state.responses_received + 1
+
+    state = %{state | neighbor_count: new_count, responses_received: new_responses}
+
+    if new_responses == length(state.neighbors) do
+      next = compute_next_state(state.alive, state.neighbor_count)
+      send(state.coordinator, {:cell_ready, self(), next})
+      {:noreply, %{state | next_state: next}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_cast(:apply_next, state) do
+    {:noreply, %{state | alive: state.next_state}}
+  end
+
+  def handle_info({:state_request, from_pid}, state) do
+    send(from_pid, {:neighbor_state, state.alive})
+    {:noreply, state}
+  end
+
+  def handle_info({:neighbor_state, alive_state}, state) do
+    handle_cast({:neighbor_state, alive_state}, state)
+  end
+
+  def handle_call(:get_state, _from, state) do
+    {:reply, {state.x, state.y, state.alive}, state}
+  end
+
+  defp compute_next_state(alive, neighbor_count) do
+    case {alive, neighbor_count} do
+      {1, 2} -> 1
+      {1, 3} -> 1
+      {0, 3} -> 1
+      _ -> 0
+    end
+  end
+end
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, Life.Cell, <<70, 79, 82, 49, 0, 0, 41, ...>>, ...}
+```
+
+## Module Coordinator
+
+The module Life.Coordinator is responsible for creating all cell processes and orchestrating their synchronization, ensuring that each generation of the simulation evolves in a consistent and coordinated manner.
+
+```elixir
+defmodule Life.Coordinator do
+  use GenServer
+
+  @size 30
+  @worker :"worker@127.0.0.1"
+
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+  end
+
+  def step, do: GenServer.cast(__MODULE__, :step)
+  def grid, do: GenServer.call(__MODULE__, :grid)
+  def get_cells, do: GenServer.call(__MODULE__, :get_cells)
+
+  # DEBUG / preuve distribution
+  def pids, do: GenServer.call(__MODULE__, :pids)
+
+  def init(_) do
+    master = Node.self()
+    worker = @worker
+
+    # 1) Vérifier que le worker répond
+    unless :net_adm.ping(worker) == :pong do
+      raise "Worker node not reachable: #{inspect(worker)}. Start it with: iex --name worker@127.0.0.1 --cookie life"
+    end
+
+    # 2) Vérifier que Life.Cell est chargé sur le worker
+    case :rpc.call(worker, Code, :ensure_loaded?, [Life.Cell]) do
+      true -> :ok
+      false -> raise "Life.Cell is not loaded on worker. Load it on the worker before starting coordinator."
+      other -> raise "Could not verify Life.Cell on worker: #{inspect(other)}"
+    end
+
+    # 3) Créer les cellules : moitié haute sur master, moitié basse sur worker
+    cells =
+      for x <- 0..(@size - 1), y <- 0..(@size - 1) do
+        target = if y < div(@size, 2), do: master, else: worker
+    
+        result =
+          if target == master do
+            Life.Cell.start_link(x: x, y: y, alive: Enum.random([0, 1]), coordinator: self())
+          else
+            :rpc.call(worker, Life.Cell, :start, [[
+              x: x, y: y, alive: Enum.random([0, 1]),
+              coordinator: self()
+            ]])
+          end
+    
+        {:ok, pid} =
+          case result do
+            {:ok, pid} -> {:ok, pid}
+            other -> raise "Failed to start cell at (#{x},#{y}) on #{inspect(target)}: #{inspect(other)}"
+          end
+    
+        {{x, y}, pid}
+      end
+      |> Map.new()
+
+
+    # 4) Configurer les voisins (cast OK sur pid local/distant)
+    Enum.each(cells, fn {{x, y}, pid} ->
+      neighbors = get_neighbor_pids(cells, x, y)
+      Life.Cell.set_neighbors(pid, neighbors)
+    end)
+
+    {:ok, %{cells: cells, ready_cells: MapSet.new(), total_cells: map_size(cells)}}
+  end
+
+  defp get_neighbor_pids(cells, x, y) do
+    for dx <- -1..1,
+        dy <- -1..1,
+        {dx, dy} != {0, 0} do
+      Map.get(cells, {x + dx, y + dy})
+    end
+    |> Enum.filter(& &1)
+  end
+
+  def handle_cast(:step, state) do
+    state = %{state | ready_cells: MapSet.new()}
+
+    Enum.each(state.cells, fn {_pos, pid} ->
+      Life.Cell.request_neighbors(pid)
+    end)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:cell_ready, pid, _next_state}, state) do
+    ready_cells = MapSet.put(state.ready_cells, pid)
+
+    if MapSet.size(ready_cells) == state.total_cells do
+      Enum.each(state.cells, fn {_pos, pid} ->
+        Life.Cell.apply_next(pid)
+      end)
+
+      send_update()
+    end
+
+    {:noreply, %{state | ready_cells: ready_cells}}
+  end
+
+  def handle_call(:grid, _from, state) do
+    grid =
+      state.cells
+      |> Enum.map(fn {_pos, pid} -> Life.Cell.get_state(pid) end)
+      |> Enum.map(fn {x, y, alive} -> {{x, y}, alive} end)
+      |> Map.new()
+
+    {:reply, grid, state}
+  end
+
+  def handle_call(:get_cells, _from, state) do
+    {:reply, map_size(state.cells), state}
+  end
+
+  def handle_call(:pids, _from, state) do
+    {:reply, state.cells, state}
+  end
+
+  defp send_update do
+    case Process.whereis(Life.Controller) do
+      nil -> :ok
+      pid -> send(pid, :generation_complete)
+    end
+  end
+end
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, Life.Coordinator, <<70, 79, 82, 49, 0, 0, 51, ...>>, ...}
+```
+
+## Module Controller
+
+This module Life.Controller controls the execution flow of the simulation and coordinates timing and updates.
+
+```elixir
+defmodule Life.Controller do
+  use GenServer
+
+  @interval 300
+
+  def start_link(_) do
+    GenServer.start_link(
+      __MODULE__,
+      %{running: false, subscribers: MapSet.new()},
+      name: __MODULE__
+    )
+  end
+
+  def start, do: GenServer.cast(__MODULE__, :start)
+  def stop, do: GenServer.cast(__MODULE__, :stop)
+  def step, do: GenServer.cast(__MODULE__, :step)
+  def subscribe(pid), do: GenServer.cast(__MODULE__, {:subscribe, pid})
+
+  def init(state), do: {:ok, state}
+
+  def handle_cast({:subscribe, pid}, state) do
+    {:noreply, %{state | subscribers: MapSet.put(state.subscribers, pid)}}
+  end
+
+  def handle_cast(:step, state) do
+    Life.Coordinator.step()
+    {:noreply, state}
+  end
+
+  def handle_cast(:start, state) do
+    Life.Coordinator.step()
+    {:noreply, %{state | running: true}}
+  end
+
+  def handle_cast(:stop, state) do
+    {:noreply, %{state | running: false}}
+  end
+
+  def handle_info(:generation_complete, %{running: true} = state) do
+    notify(state.subscribers)
+    Process.send_after(self(), :tick, @interval)
+    {:noreply, state}
+  end
+
+  def handle_info(:generation_complete, state) do
+    notify(state.subscribers)
+    {:noreply, state}
+  end
+
+  def handle_info(:tick, %{running: true} = state) do
+    Life.Coordinator.step()
+    {:noreply, state}
+  end
+
+  def handle_info(:tick, state), do: {:noreply, state}
+
+  defp notify(subscribers) do
+    Enum.each(subscribers, fn pid ->
+      send(pid, :update_display)
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, Life.Controller, <<70, 79, 82, 49, 0, 0, 38, ...>>, ...}
+```
+
+## Module Display
+
+This module Life.Display is responsible for converting the simulation state into a readable visual representation for display in the user interface.
+
+```elixir
+defmodule Life.Display do
+  @size 30
+
+  def as_table(grid) do
+    for y <- 0..(@size - 1) do
+      for x <- 0..(@size - 1) do
+        if Map.get(grid, {x, y}) == 1, do: "⚫️", else: "⚪️"
+      end
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, Life.Display, <<70, 79, 82, 49, 0, 0, 10, ...>>, ...}
+```
+
+## System initialization
+
+The cell below establishes the distributed connection between the master and worker nodes and checks that the worker node is reachable before starting the simulation.
+
+```elixir
+Node.connect(:"worker@127.0.0.1")
+:net_adm.ping(:"worker@127.0.0.1")
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:pong
+```
+
+The code below starts the core coordination and control processes and confirms successful initialization by reporting the number of cell and active BEAM processes.
+
+```elixir
+# Optional: two if conditions used to ensure a clean restart 
+if pid = Process.whereis(Life.Coordinator), do: Process.exit(pid, :kill)
+if pid = Process.whereis(Life.Controller), do: Process.exit(pid, :kill)
+
+{:ok, _} = Life.Coordinator.start_link([])
+{:ok, _} = Life.Controller.start_link([])
+
+cell_count = Life.Coordinator.get_cells()
+process_count = Process.list() |> length()
+
+IO.puts("✓ #{cell_count} cell processes created")
+IO.puts("✓ Total BEAM processes: #{process_count}")
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+✓ 900 cell processes created
+✓ Total BEAM processes: 546
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Interactive Interface and Visualization
+
+This section uses Kino to display the grid and control the simulation, updating the view after each generation.
+
+````elixir
+frame = Kino.Frame.new()
+Kino.render(frame)
+
+step_btn = Kino.Control.button("Step")
+start_btn = Kino.Control.button("Start")
+stop_btn = Kino.Control.button("Stop")
+
+Kino.render(Kino.Layout.grid([step_btn, start_btn, stop_btn], columns: 3))
+
+render = fn ->
+  grid = Life.Coordinator.grid()
+
+  text =
+    grid
+    |> Life.Display.as_table()
+    |> Enum.map(&Enum.join(&1, " "))
+    |> Enum.join("\n")
+
+  Kino.Frame.render(frame, Kino.Markdown.new("```\n#{text}\n```"))
+end
+
+render.()
+
+spawn(fn ->
+  Life.Controller.subscribe(self())
+
+  receive_loop = fn receive_loop ->
+    receive do
+      :update_display ->
+        render.()
+        receive_loop.(receive_loop)
+    end
+  end
+
+  receive_loop.(receive_loop)
+end)
+
+Kino.listen(step_btn, fn _ ->
+  Life.Controller.step()
+end)
+
+Kino.listen(start_btn, fn _ ->
+  Life.Controller.start()
+end)
+
+Kino.listen(stop_btn, fn _ ->
+  Life.Controller.stop()
+end)
+
+:ok
+````
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Validation / Evaluation of the Solution
+
+This inspection belowconfirms the distributed execution of the simulation by showing that different cells are running on different BEAM nodes, namely the master and the worker.
+
+```elixir
+cells = Life.Coordinator.pids()
+{node(cells[{0, 10}]), node(cells[{0, 20}])}
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:"master--qpinq7kp@127.0.0.1", :"worker@127.0.0.1"}
+```
+
+```elixir
+# Afficher l'état d'une cellule spécifique
+grid = Life.Coordinator.grid()
+cell_15_15 = Map.get(grid, {15, 15})
+IO.puts("Cell (15,15) state: #{cell_15_15}")
+
+# Compter les cellules vivantes
+alive_count = grid |> Map.values() |> Enum.sum()
+IO.puts("Alive cells: #{alive_count}/900")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Cell (15,15) state: 0
+Alive cells: 423/900
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## References
+
+* [Conway's Game of Life](https://en.wikipedia.org/wiki/Conway%27s_Game_of_Life)
+* [Elixir GenServer](https://hexdocs.pm/elixir/GenServer.html)
+* [Kino Documentation](https://hexdocs.pm/kino/)
